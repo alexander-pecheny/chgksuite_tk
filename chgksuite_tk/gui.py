@@ -9,13 +9,17 @@ import sys
 try:
     import tkinter as tk
     import tkinter.filedialog as filedialog
+    import tkinter.simpledialog as simpledialog
 
     TKINTER = True
 except ImportError:
     TKINTER = False
 
+import builtins
+import io
 import json
 import shlex
+import threading
 
 from chgksuite.common import (
     DefaultNamespace,
@@ -25,6 +29,29 @@ from chgksuite.common import (
 )
 from chgksuite.version import __version__
 from chgksuite.cli import ArgparseBuilder, single_action
+
+
+class InputRequester:
+    """Helper to request input from main thread via Tk dialog."""
+
+    def __init__(self, tk_root):
+        self.tk_root = tk_root
+        self.response = None
+        self.event = threading.Event()
+
+    def _show_dialog(self, prompt):
+        self.response = simpledialog.askstring("Input Required", prompt, parent=self.tk_root)
+        if self.response is None:
+            self.response = ""
+        self.event.set()
+
+    def request_input(self, prompt=""):
+        self.event.clear()
+        self.response = None
+        # Schedule dialog on main thread
+        self.tk_root.after_idle(lambda: self._show_dialog(prompt))
+        self.event.wait()  # Block until dialog is closed
+        return self.response
 
 
 class VarWrapper(object):
@@ -124,8 +151,58 @@ class ParserWrapper(object):
 
     def ok_button_press(self):
         self.cmdline_call = self.build_command_line_call()
-        self.tk.quit()
-        self.tk.destroy()
+        if not self.cmdline_call:
+            return
+
+        # Clear output and disable button
+        self.output_text.config(state="normal")
+        self.output_text.delete("1.0", "end")
+        self.output_text.config(state="disabled")
+        self.ok_button.config(state="disabled")
+
+        # Capture stdout/stderr in a thread
+        self.output_buffer = io.StringIO()
+        self.worker_done = False
+
+        # Create input requester for GUI input dialogs
+        self.input_requester = InputRequester(self.tk)
+
+        def worker():
+            old_stdout, old_stderr = sys.stdout, sys.stderr
+            old_input = builtins.input
+            sys.stdout = sys.stderr = self.output_buffer
+            builtins.input = self.input_requester.request_input
+            try:
+                _, resourcedir = get_source_dirs()
+                args = DefaultNamespace(self.parser.parse_args(self.cmdline_call))
+                single_action(args, False, resourcedir)
+            except Exception as e:
+                print(f"Error: {e}")
+            finally:
+                sys.stdout, sys.stderr = old_stdout, old_stderr
+                builtins.input = old_input
+                self.worker_done = True
+
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
+        self.poll_output()
+
+    def poll_output(self):
+        content = self.output_buffer.getvalue()
+        if content:
+            self.output_text.config(state="normal")
+            self.output_text.delete("1.0", "end")
+            self.output_text.insert("end", content)
+            self.output_text.see("end")
+            self.output_text.config(state="disabled")
+        if not self.worker_done:
+            self.tk.after(100, self.poll_output)
+        else:
+            self.ok_button.config(state="normal")
+            self.output_text.config(state="normal")
+            self.output_text.insert("end", "\n--- Готово ---\n")
+            self.output_text.see("end")
+            self.output_text.config(state="disabled")
 
     def toggle_advanced_frame(self):
         value = self.advanced_checkbox_var.get()
@@ -137,10 +214,10 @@ class ParserWrapper(object):
     def init_tk(self):
         self.tk = tk.Tk()
         self.tk.title("chgksuite v{}".format(__version__))
-        self.tk.minsize(600, 300)
+        self.tk.minsize(600, 400)
         self.tk.eval("tk::PlaceWindow . center")
         self.mainframe = tk.Frame(self.tk)
-        self.mainframe.pack(side="top")
+        self.mainframe.pack(side="top", fill="both", expand=True)
         self.frame = tk.Frame(self.mainframe)
         self.frame.pack(side="top")
         self.button_frame = tk.Frame(self.mainframe)
@@ -166,6 +243,16 @@ class ParserWrapper(object):
         self.advanced_frame = tk.Frame(self.mainframe)
         self.advanced_frame.pack(side="top")
         self.advanced_frame.pack_forget()
+
+        # Output text widget
+        self.output_frame = tk.Frame(self.mainframe)
+        self.output_frame.pack(side="top", fill="both", expand=True, pady=10)
+        self.output_text = tk.Text(self.output_frame, height=10, width=70, font=("Courier", 10))
+        self.output_scrollbar = tk.Scrollbar(self.output_frame, command=self.output_text.yview)
+        self.output_text.configure(yscrollcommand=self.output_scrollbar.set)
+        self.output_text.pack(side="left", fill="both", expand=True)
+        self.output_scrollbar.pack(side="right", fill="y")
+        self.output_text.config(state="disabled")
 
     def add_argument(self, *args, **kwargs):
         if kwargs.pop("advanced", False):
@@ -260,10 +347,8 @@ class ParserWrapper(object):
         argv = sys.argv[1:]
         if not argv:
             self.tk.mainloop()
-            if self.cmdline_call:
-                return self.parser.parse_args(self.cmdline_call)
-            else:
-                sys.exit(0)
+            # Window closed by user, exit cleanly
+            sys.exit(0)
         return self.parser.parse_args(*args, **kwargs)
 
 
@@ -296,13 +381,13 @@ def app():
     ld = get_lastdir()
     use_wrapper = len(sys.argv) == 1 and TKINTER
     if use_wrapper:
-        while True:
-            parser = argparse.ArgumentParser(prog="chgksuite")
-            parser = ParserWrapper(parser, lastdir=ld)
-            ArgparseBuilder(parser, use_wrapper).build()
-            args = DefaultNamespace(parser.parse_args())
-            single_action(args, False, resourcedir)
+        # GUI mode: window stays open, subprocess runs via ok_button_press()
+        parser = argparse.ArgumentParser(prog="chgksuite")
+        parser = ParserWrapper(parser, lastdir=ld)
+        ArgparseBuilder(parser, use_wrapper).build()
+        parser.parse_args()  # Shows window, runs event loop until closed
     else:
+        # CLI mode: run directly
         parser = argparse.ArgumentParser(prog="chgksuite")
         ArgparseBuilder(parser, use_wrapper).build()
         args = DefaultNamespace(parser.parse_args())
