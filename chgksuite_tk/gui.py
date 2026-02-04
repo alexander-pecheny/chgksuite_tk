@@ -4,12 +4,16 @@ from __future__ import unicode_literals
 
 import argparse
 import os
+import subprocess
 import sys
+import urllib.request
 
 try:
     import tkinter as tk
     import tkinter.filedialog as filedialog
+    import tkinter.messagebox as messagebox
     import tkinter.simpledialog as simpledialog
+    from tkinter import ttk
 
     TKINTER = True
 except ImportError:
@@ -31,6 +35,69 @@ from chgksuite.version import __version__
 from chgksuite.cli import ArgparseBuilder, single_action
 
 
+def is_app_translocated(path):
+    """Check if the app is running from macOS App Translocation."""
+    if sys.platform == "darwin" and path:
+        return "/AppTranslocation/" in path
+    return False
+
+
+def get_pyapp_executable():
+    """Return the pyapp executable path if running inside pyapp, else None."""
+    pyapp_env = os.environ.get("PYAPP", "")
+    # PYAPP_PASS_LOCATION sets PYAPP to the executable path instead of "1"
+    if pyapp_env and pyapp_env != "1" and os.path.isfile(pyapp_env):
+        return pyapp_env
+    return None
+
+
+def get_installed_version(package_name):
+    """Get installed version of a package."""
+    try:
+        from importlib.metadata import version
+
+        return version(package_name)
+    except Exception:
+        return None
+
+
+def check_pypi_version(package_name):
+    """Get latest version of a package from PyPI."""
+    try:
+        url = f"https://pypi.org/pypi/{package_name}/json"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            return data["info"]["version"]
+    except Exception:
+        return None
+
+
+def check_for_updates():
+    """Check PyPI for updates to chgksuite and chgksuite-tk. Returns (has_update, details_str, error)."""
+    packages = ["chgksuite", "chgksuite-tk"]
+    updates = []
+
+    for pkg in packages:
+        installed = get_installed_version(pkg)
+        latest = check_pypi_version(pkg)
+        if installed is None or latest is None:
+            continue
+        if installed != latest:
+            updates.append((pkg, installed, latest))
+
+    if updates:
+        details = "\n".join(f"{pkg}: {inst} → {lat}" for pkg, inst, lat in updates)
+        return True, details, None
+
+    # No updates - show current versions
+    current = ", ".join(
+        f"{pkg} {get_installed_version(pkg)}"
+        for pkg in packages
+        if get_installed_version(pkg)
+    )
+    return False, current, None
+
+
 class InputRequester:
     """Helper to request input from main thread via Tk dialog."""
 
@@ -40,7 +107,9 @@ class InputRequester:
         self.event = threading.Event()
 
     def _show_dialog(self, prompt):
-        self.response = simpledialog.askstring("Input Required", prompt, parent=self.tk_root)
+        self.response = simpledialog.askstring(
+            "Input Required", prompt, parent=self.tk_root
+        )
         if self.response is None:
             self.response = ""
         self.event.set()
@@ -170,8 +239,10 @@ class ParserWrapper(object):
         def worker():
             old_stdout, old_stderr = sys.stdout, sys.stderr
             old_input = builtins.input
+            old_no_color = os.environ.get("NO_COLOR")
             sys.stdout = sys.stderr = self.output_buffer
             builtins.input = self.input_requester.request_input
+            os.environ["NO_COLOR"] = "1"  # Disable ANSI colors in output
             try:
                 _, resourcedir = get_source_dirs()
                 args = DefaultNamespace(self.parser.parse_args(self.cmdline_call))
@@ -181,6 +252,10 @@ class ParserWrapper(object):
             finally:
                 sys.stdout, sys.stderr = old_stdout, old_stderr
                 builtins.input = old_input
+                if old_no_color is None:
+                    os.environ.pop("NO_COLOR", None)
+                else:
+                    os.environ["NO_COLOR"] = old_no_color
                 self.worker_done = True
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
@@ -210,6 +285,82 @@ class ParserWrapper(object):
             self.advanced_frame.pack()
         else:
             self.advanced_frame.pack_forget()
+
+    def check_and_update(self):
+        """Check for updates and run self-update if available."""
+        self.update_button.config(state="disabled", text="Проверка обновлений...")
+
+        def check_thread():
+            has_update, details, error = check_for_updates()
+            # Schedule UI update on main thread
+            self.tk.after(
+                0, lambda: self._handle_update_check(has_update, details, error)
+            )
+
+        threading.Thread(target=check_thread, daemon=True).start()
+
+    def _handle_update_check(self, has_update, details, error):
+        """Handle update check result on main thread."""
+        self.update_button.config(state="normal", text="Обновить chgksuite")
+
+        if has_update is None or (not has_update and not details):
+            messagebox.showwarning(
+                "Ошибка",
+                "Не удалось проверить обновления. Проверьте подключение к интернету.",
+            )
+            return
+
+        if not has_update:
+            messagebox.showinfo(
+                "Обновления", f"Уже установлена последняя версия.\n\n{details}"
+            )
+            return
+
+        # Update available - ask user
+        reply = messagebox.askyesno(
+            "Доступно обновление",
+            f"Доступны обновления:\n{details}\n\n"
+            "Обновить сейчас? Приложение будет закрыто.",
+        )
+
+        if reply:
+            self._run_self_update()
+
+    def _run_self_update(self):
+        """Run pyapp self-update command and close the application."""
+        # Check for macOS App Translocation
+        if is_app_translocated(self.pyapp_executable):
+            messagebox.showwarning(
+                "Обновление невозможно",
+                "Приложение запущено из временной папки (App Translocation).\n\n"
+                "Чтобы обновить приложение:\n"
+                "1. Закройте приложение\n"
+                "2. Переместите его в папку «Программы» (Applications)\n"
+                "3. Запустите приложение снова и нажмите «Обновить»",
+            )
+            return
+
+        try:
+            # Start the update process detached from current process
+            if sys.platform == "win32":
+                # On Windows, use CREATE_NEW_PROCESS_GROUP to detach
+                subprocess.Popen(
+                    [self.pyapp_executable, "self", "update"],
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                    | subprocess.DETACHED_PROCESS,
+                    close_fds=True,
+                )
+            else:
+                # On Unix, use start_new_session to detach
+                subprocess.Popen(
+                    [self.pyapp_executable, "self", "update"],
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            # Close the application
+            self.tk.quit()
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось запустить обновление: {e}")
 
     def init_tk(self):
         self.tk = tk.Tk()
@@ -247,12 +398,27 @@ class ParserWrapper(object):
         # Output text widget
         self.output_frame = tk.Frame(self.mainframe)
         self.output_frame.pack(side="top", fill="both", expand=True, pady=10)
-        self.output_text = tk.Text(self.output_frame, height=10, width=70, font=("Courier", 10))
-        self.output_scrollbar = tk.Scrollbar(self.output_frame, command=self.output_text.yview)
+        self.output_text = tk.Text(
+            self.output_frame, height=10, width=70, font=("Courier", 10)
+        )
+        self.output_scrollbar = tk.Scrollbar(
+            self.output_frame, command=self.output_text.yview
+        )
         self.output_text.configure(yscrollcommand=self.output_scrollbar.set)
         self.output_text.pack(side="left", fill="both", expand=True)
         self.output_scrollbar.pack(side="right", fill="y")
         self.output_text.config(state="disabled")
+
+        # Update button (only shown when running inside pyapp)
+        self.pyapp_executable = get_pyapp_executable()
+        if self.pyapp_executable:
+            self.update_button = tk.Button(
+                self.mainframe,
+                text="Обновить chgksuite",
+                command=self.check_and_update,
+                width=20,
+            )
+            self.update_button.pack(side="top", pady=5)
 
     def add_argument(self, *args, **kwargs):
         if kwargs.pop("advanced", False):
@@ -265,6 +431,7 @@ class ParserWrapper(object):
         caption = kwargs.pop("caption", None) or args[0]
         argtype = kwargs.pop("argtype", None)
         filetypes = kwargs.pop("filetypes", None)
+        combobox_values = kwargs.pop("combobox_values", None) or []
         if not argtype:
             if kwargs.get("action") == "store_true":
                 argtype = "checkbutton"
@@ -328,6 +495,24 @@ class ParserWrapper(object):
             entry = tk.Entry(innerframe, textvariable=var, show=entry_show)
             entry.pack(side="left")
             self.vars.append(VarWrapper(name=args[0], var=var))
+
+        elif argtype == "combobox":
+            var = tk.StringVar()
+            default_val = kwargs.get("default") or ""
+            innerframe = tk.Frame(frame)
+            innerframe.pack(side="top")
+            tk.Label(innerframe, text=caption).pack(side="left")
+            combobox = ttk.Combobox(
+                innerframe, textvariable=var, values=combobox_values
+            )
+            combobox.pack(side="left")
+            # Initialize with default or first item if available
+            if default_val:
+                var.set(default_val)
+            elif combobox_values:
+                var.set(combobox_values[0])
+            self.vars.append(VarWrapper(name=args[0], var=var))
+
         self.parser.add_argument(*args, **kwargs)
 
     def add_subparsers(self, *args, **kwargs):
