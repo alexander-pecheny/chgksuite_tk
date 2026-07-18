@@ -9,7 +9,7 @@ authors = [
     {name = "Alexander Pecheny", email = "ap@pecheny.me"}
 ]
 description = "A GUI wrapper for chgksuite using tkinter"
-readme = {text = "**chgksuite-tk** is a GUI wrapper around https://gitlab.com/peczony/chgksuite", content-type = "text/markdown"}
+readme = {text = "**chgksuite-tk** is a GUI wrapper around https://code.pecheny.me/pecheny/chgksuite", content-type = "text/markdown"}
 requires-python = ">=3.9"
 license = "MIT"
 classifiers = [
@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://gitlab.com/peczony/chgksuite_tk"
+Homepage = "https://code.pecheny.me/pecheny/chgksuite_tk"
 
 [project.scripts]
 chgkt = "chgksuite_tk.__main__:main"
